@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
 import numpy as np
 
-# Dataset used in pre-training.
-dataset_trained = 'QM9under14atoms_atomizationenergy_eV'
+# Dataset Dir and params settings.
+dataset_dir = 'QM9_datasets/'
+task = 'Force'
+# task = 'Dipole & Energy'
 
-# Dataset for prediction.
-dataset_predict = 'QM9over15atoms_atomizationenergy_eV'  # Extrapolation.
+
+if task == 'Force':
+	dataset_trained = 'QM9under14atoms_force_and_AE_eV'
+	dataset_predict = 'QM9over15atoms_force_and_AE_eV'  # Extrapolation.
+elif task == 'Dipole & Energy':
+	dataset_trained = 'QM9under14atoms_dipole_and_AE_eV'
+	dataset_predict = 'QM9over15atoms_dipole_and_AE_eV'
+else:
+	print('Task not recognized')
 
 
 # Basis set.

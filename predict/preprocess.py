@@ -23,6 +23,7 @@ def load_dict(filename):
 
 if __name__ == "__main__":
 
+    data_dir = args.dataset_dir
     dataset_trained = args.dataset_trained
     dataset_predict = args.dataset_predict
     basis_set = args.basis_set
@@ -32,9 +33,10 @@ if __name__ == "__main__":
     n_points = args.n_points
     rot_angle = args.rot_angle
     rot_axis = args.rot_axis
+    task = args.task
 
-    dir_trained = '../dataset/' + dataset_trained + '/'
-    dir_predict = '../dataset/' + dataset_predict + '/'
+    dir_trained = '../dataset/' + data_dir + dataset_trained + '/'
+    dir_predict = '../dataset/' + data_dir + dataset_predict + '/'
 
     dir_preprocess = (dir_trained + 'create_data' + '_' + basis_set + '/')
     filename = dir_preprocess + 'orbitaldict_' + basis_set + '.pickle'
@@ -43,14 +45,12 @@ if __name__ == "__main__":
 
     print('Preprocess', dataset_predict, 'dataset.\n'
           'The preprocessed dataset is saved in', dir_predict, 'directory.\n'
-          'If the dataset size is large, '
-          'it takes a long time and consume storage.\n'
           'Wait for a while...')
     print('-'*50)
 
     pp.create_dataset(dir_predict, 'test',
                       basis_set, radius_min, radius_max, radius_step,
-                      n_points, rot_angle, rot_axis, orbital_dict)
+                      n_points, rot_angle, rot_axis, orbital_dict, task=task)
 
     if N_orbitals < len(orbital_dict):
         print('##################### Warning!!!!!! #####################\n'
