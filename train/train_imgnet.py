@@ -680,7 +680,7 @@ if __name__ == "__main__":
         file_model = '../model/{}/best_model.pth'.format(task)
         model.load_state_dict(torch.load(file_model, map_location=device))
 
-        for param in model.parameters():  # 对网络的所有参数进行for循环
+        for param in model.parameters():
             param.requires_grad = False
 
         if task == 'Force':
