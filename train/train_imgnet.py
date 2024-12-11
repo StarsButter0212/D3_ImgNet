@@ -1,32 +1,26 @@
 #!/usr/bin/env python3
-import os
+import os, sys
 import time
-import sys
-from pathlib import Path
+
 import pickle
 import timeit
-import collections
 import numpy as np
-
+from tqdm import tqdm
+from pathlib import Path
+from datetime import datetime
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.utils.data
-from torch.autograd import Variable
 from torch.nn.modules.utils import _pair
 
 sys.path.append('../')
 import train.train_args as args
-from datetime import datetime
-from tqdm import tqdm
+
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-np.set_printoptions(threshold=1e6)  # Unomitted display
-np.set_printoptions(linewidth=300)  # No wrap
-torch.set_printoptions(threshold=1e6)  # Unomitted display
-torch.set_printoptions(linewidth=300)  # No wrap
 
 
 # *****************************************************************************************
@@ -174,12 +168,12 @@ class BasicBlock(nn.Module):
 class D3_ImgNet(nn.Module):
     """ Main network."""
 
-    def __init__(self, device, basis_file, N_type_orbitals, dim, seq_len,
-                 operation, dropout=0):
+    def __init__(self, device, basis_file, N_type_orbitals, dim, seq_len, task,
+                 transfer_flag, force_posc=False, dropout=0):
         super(D3_ImgNet, self).__init__()
 
         """All learning parameters of the model."""
-        self.basis_file = '../basissets/' + basis_file + '.gbs'
+        self.basis_file = basis_file + '.gbs'
         self.coefficient = nn.Embedding(N_type_orbitals, dim)
         self.zeta = nn.Embedding(N_type_orbitals, 1)  # Orbital exponent.
         nn.init.ones_(self.zeta.weight)
@@ -188,6 +182,8 @@ class D3_ImgNet(nn.Module):
         self.dilated = True
         self.drop = dropout
         self.seq_len = seq_len
+        self.task = task
+        self.force_posc = force_posc
 
         block = BasicBlock
         layers = [1, 1, 1, 1]
@@ -234,14 +230,19 @@ class D3_ImgNet(nn.Module):
                                            norm_layer=norm_layer)
 
         self.avgpool = nn.AdaptiveAvgPool2d(1)
-        self.res_output = nn.Linear(256, 1)
+        if transfer_flag:
+            self.res_output = nn.Linear(256, 1)
+        else:
+            if task == 'Force':
+                self.res_output = nn.Linear(256, 3)
+            else:
+                self.res_output = nn.Linear(256, 1)
 
         self._initialize_weights()
 
         # Other parameters
         self.device = device
         self.dim = dim
-        self.operation = operation
 
     def _make_layer(self, block, planes, blocks, stride=1, dilation=1, norm_layer=None,
                     is_first=True):
@@ -303,18 +304,14 @@ class D3_ImgNet(nn.Module):
 
     def list_to_batch(self, xs, dtype=torch.FloatTensor, set=None, cat=None, axis=None):
         """Transform the list of numpy data into the batch of tensor data."""
-        if set:
-            xs = np.concatenate([x for x in xs])
-        else:
-            xs = [dtype(x).to(self.device) for x in xs]
+        if set: xs = np.concatenate([x for x in xs])
+        else: xs = [dtype(x).to(self.device) for x in xs]
 
-        if cat:
-            return torch.cat(xs, axis)
-        else:
-            return xs
+        if cat: return torch.cat(xs, axis)
+        else: return xs
 
     def basis_matrix(self, atomic_orbitals, distance_matrices, n_quantum_numbers, l_quantum_numbers):
-        """Transform the distance matrix into a basis matrix_1."""
+        """Transform the distance matrix into a basis matrix."""
         zetas = torch.squeeze(self.zeta(atomic_orbitals))
         GTOs = (distance_matrices ** (l_quantum_numbers) *
                 distance_matrices ** (2 * (n_quantum_numbers - l_quantum_numbers - 1)) *
@@ -347,6 +344,7 @@ class D3_ImgNet(nn.Module):
         densities, atoms = [], []
         for atomic_orbital, distance_matrice, n_quantum_number, l_quantum_number, N_elec in \
                 zip(atomic_orbitals, distance_matrices, n_quantum_numbers, l_quantum_numbers, N_electrons):
+
             basis_sets = self.basis_matrix(atomic_orbital, distance_matrice, n_quantum_number, l_quantum_number)
             orbital_coefs = F.normalize(self.coefficient(atomic_orbital), p=2, dim=0)
 
@@ -375,52 +373,96 @@ class D3_ImgNet(nn.Module):
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
 
+        if operation == 'none':
+            return x
         if operation == 'sum':
             vectors = [torch.sum(vs, 0) for vs in torch.split(x, axis, dim=0)]
         if operation == 'mean':
             vectors = [torch.mean(vs, 0) for vs in torch.split(x, axis, dim=0)]
         return torch.stack(vectors)
 
-    def forward(self, data, train=False, target=None, predict=False):
+    def forward(self, data, train=False, task='Force', operation='none', dipole_mul=False):
 
-        idx, inputs, energies = data[0], data[2:7], data[7]
-        N_atoms, molecular_formula = data[1], data[8]
+        idx, inputs, values = data[0], data[2:7], data[7]
+        N_atoms, mols_formula = data[1], data[8]
 
-        if predict:
-            with torch.no_grad():
-                densities, atoms = self.train_densities_data(inputs)
-                final_layer = self.img2point(densities,
-                                             self.operation, atoms)
-                E_ = self.res_output(final_layer)
-            return idx, E_
+        if task == 'Force': forces = data[-1]
+        atomic_pcoords = self.list_to_batch(data[10], cat=True, axis=0)
 
-        elif train:
+        if task == 'Dipole' or task == 'Energy':
+            partial_charges = self.list_to_batch(data[-1], cat=True, axis=0)
+
+        if train:
             densities, atoms = self.train_densities_data(inputs)
+            final_layer = self.img2point(densities, operation, atoms)
+            out = self.res_output(final_layer)
 
-            if target == 'E':  # Supervised learning for energy.
-                E = self.list_to_batch(energies, cat=True, axis=0)  # Correct E.
-                final_layer = self.img2point(densities,
-                                             self.operation, atoms)
-                E_ = self.res_output(final_layer)  # Predicted E.
-                loss = F.mse_loss(E, E_)
-                loss_ = F.mse_loss(E, E_, reduction='sum')
+            if task == 'Force':
+                target = self.list_to_batch(forces, cat=True, axis=0)
+                if self.force_posc:
+                    out += atomic_pcoords
+                mse_loss = F.mse_loss(out, target, reduction='none')
+                mse_loss = [torch.sum(vs, dim=1).mean() / 3 for vs in torch.split(mse_loss, atoms, dim=0)]
+                loss = torch.mean(torch.stack(mse_loss))
+                loss_ = torch.sum(torch.stack(mse_loss))
+            else:
+                target_ = self.list_to_batch(values, cat=True, axis=0)
+                if task == 'Energy':
+                    target = target_[:, 0].unsqueeze(1)
+                if task == 'SN2_all':
+                    target = target_[:, 2].unsqueeze(1)
+                if task == 'Dipole':
+                    target = target_[:, 1].unsqueeze(1)
+
+                    if dipole_mul:
+                        dipole_moment = (partial_charges + out) * atomic_pcoords
+                    else:
+                        dipole_moment = (out + 1e-8) * atomic_pcoords
+                    dipole_moment = [torch.sum(p, dim=0) for p in torch.split(dipole_moment, atoms, dim=0)]
+                    out = torch.sqrt(torch.sum(torch.stack(dipole_moment) ** 2, dim=1, keepdim=True))
+
+                loss = F.mse_loss(out, target)
+                loss_ = F.mse_loss(out, target, reduction='sum')
             return loss, loss_
 
         else:  # Test.
             with torch.no_grad():
-                E = self.list_to_batch(energies, cat=True, axis=0)
                 densities, atoms = self.train_densities_data(inputs)
-                final_layer = self.img2point(densities,
-                                             self.operation, atoms)
-                E_ = self.res_output(final_layer)
-                return idx, N_atoms, E, E_, molecular_formula
+                final_layer = self.img2point(densities, operation, atoms)
+                out = self.res_output(final_layer)
+
+                if task == 'Force':
+                    target = self.list_to_batch(forces, cat=True, axis=0)
+                    if self.force_posc:
+                        out += atomic_pcoords
+                else:
+                    target_ = self.list_to_batch(values, cat=True, axis=0)
+                    if task == 'Energy':
+                        target = target_[:, 0].unsqueeze(1)
+                    if task == 'SN2_all':
+                        target = target_[:, 2].unsqueeze(1)
+                    if task == 'Dipole':
+                        target = target_[:, 1].unsqueeze(1)
+
+                        if dipole_mul:
+                            dipole_moment = (partial_charges + out) * atomic_pcoords
+                        else:
+                            dipole_moment = (out + 1e-8) * atomic_pcoords
+                        dipole_moment = [torch.sum(p, dim=0) for p in torch.split(dipole_moment, atoms, dim=0)]
+                        out = torch.sqrt(torch.sum(torch.stack(dipole_moment) ** 2, dim=1, keepdim=True))
+
+                return idx, N_atoms, out, target, mols_formula, atoms
 
 
 class Trainer(object):
-    def __init__(self, model, lr):
+    def __init__(self, model, lr, task='Force', operation='none', dipole_mul=False):
         self.model = model
+        self.task = task
+        self.operation = operation
+        self.dipole_mul = dipole_mul
 
-        self.optimizer = optim.AdamW(self.model.parameters(), lr, weight_decay=1e-3)
+        update_params = self.model.res_output.parameters() if transfer_flag else self.model.parameters()
+        self.optimizer = optim.AdamW(update_params, lr, weight_decay=1e-3)
         self.scheduler = optim.lr_scheduler.OneCycleLR(self.optimizer, 5 * lr,
                                                        total_steps=270, pct_start=0.2)
 
@@ -433,59 +475,93 @@ class Trainer(object):
         self.model.train()
 
         """Minimize two loss functions in terms of E."""
-        losses_E, losses_E_sum = 0, 0
+        losses, losses_sum = 0, 0
         loop_data = tqdm(enumerate(dataloader), total=len(dataloader))
         start_time = datetime.now()
 
         for index, data in loop_data:
-            loss_E, loss_E_sum = self.model.forward(data, train=True, target='E')
-            self.optimize(loss_E, self.optimizer)
-            losses_E += loss_E.item()
-            losses_E_sum += loss_E_sum.item()
+            loss, loss_sum = self.model.forward(data, train=True, task=self.task,
+                                                operation=self.operation, dipole_mul=self.dipole_mul)
+            self.optimize(loss, self.optimizer)
+            losses += loss.item()
+            losses_sum += loss_sum.item()
 
             delta_time = datetime.now() - start_time
             loop_data.set_description('\33[36m【Epoch {0:04d}】'.format(epoch))
-            loop_data.set_postfix({'loss_E_sum': '{0:.6f}'.format(losses_E_sum),
-                                   'loss_E': '{0:.6f}'.format(losses_E),
+            loop_data.set_postfix({'loss_sum': '{0:.6f}'.format(losses_sum),
+                                   'loss': '{0:.6f}'.format(losses),
                                    'cost_time': '{0}'.format(delta_time)}, '\33[0m')
 
         self.scheduler.step()
-        return losses_E / len(dataloader), losses_E_sum
+        return losses / len(dataloader), losses_sum
 
 
 class Tester(object):
-    def __init__(self, model):
+    def __init__(self, model, task='Force', operation='none', dipole_mul=False, value=False):
         self.model = model
+        self.task = task
+        self.operation = operation
+        self.dipole_mul = dipole_mul
+
+        self.value = value
 
     def test(self, dataloader):
         self.model.eval()
+
         N = sum([len(data[0]) for data in dataloader])
-        IDs, N_atoms, Es, Es_, molecular_formula = [], [], [], [], []
+        IDs, N_atoms, outs, targets, mols_formula = [], [], [], [], []
         SAE, loss_val, losses_val = 0, 0, 0  # Sum absolute error.
 
         for i, data in enumerate(dataloader):
-            idx, AOs, E, E_, MOL = self.model.forward(data)
-            SAE_batch = torch.sum(torch.abs(E - E_), 0)
-            SAE += SAE_batch
+            idx, AOs, out, target, MOL, atoms = self.model.forward(data, task=self.task,
+                                                                   operation=self.operation,
+                                                                   dipole_mul=self.dipole_mul)
             IDs += list(idx)
             N_atoms += list(AOs)
-            Es += E.tolist()
-            Es_ += E_.tolist()
-            molecular_formula += list(MOL)
-            loss_val += F.mse_loss(E, E_).item()  # Mean squared error.
-            losses_val += F.l1_loss(E, E_,
-                                    reduction='sum').item()  # Sum of mean absolute error.
+            mols_formula += list(MOL)
+
+            if self.task == 'Force':
+                outs += [a.tolist() for a in torch.split(out, atoms, dim=0)]
+                targets += [a.tolist() for a in torch.split(target, atoms, dim=0)]
+
+                SAE_batch = F.l1_loss(out, target, reduction='none')
+                SAE_batch = [torch.sum(vs, dim=1).mean() / 3 for vs in torch.split(SAE_batch, atoms, dim=0)]
+                SAE += torch.sum(torch.stack(SAE_batch).unsqueeze(1), 0)
+
+                loss = F.mse_loss(out, target, reduction='none')
+                loss = [torch.sum(vs, dim=1).mean() / 3 for vs in torch.split(loss, atoms, dim=0)]
+                loss_val += torch.tensor(loss).mean()
+                losses_val += torch.tensor(loss).sum()
+            else:
+                outs += out.tolist()
+                targets += target.tolist()
+                SAE_batch = torch.sum(torch.abs(out - target), 0)
+                SAE += SAE_batch
+                loss_val += F.mse_loss(out, target).item()  # Mean squared error.
+                losses_val += F.l1_loss(out, target, reduction='sum').item()  # Sum of mean absolute error.
+
+        if self.value:
+            value_out = torch.split(out, atoms, dim=0)
+            return value_out
 
         MAE = (SAE / N).tolist()  # Mean absolute error.
         MAE = ','.join([str(m) for m in MAE])  # For homo and lumo.
 
-        prediction = 'ID\tN_atoms\tMolecular\tCorrect\tPredict\tError\n'
-        for idx, AOs, E, E_, MOL in zip(IDs, N_atoms, Es, Es_, molecular_formula):
-            error = np.abs(np.array(E) - np.array(E_))
-            error = ','.join([str(e) for e in error])
-            E = ','.join([str(e) for e in E])
-            E_ = ','.join([str(e) for e in E_])
-            prediction += '\t'.join([idx, str(AOs), MOL, E, E_, error]) + '\n'
+        if self.task == 'Force':
+            prediction = 'ID\tN_atoms\tMolecular\tError\n'
+        else:
+            prediction = 'ID\tN_atoms\tMolecular\tCorrect\tPredict\tError\n'
+
+        for idx, AOs, pred, vals, MOL in zip(IDs, N_atoms, outs, targets, mols_formula):
+            if self.task == 'Force':
+                error = str(np.abs(np.array(pred) - np.array(vals)).mean())
+                prediction += '\t'.join([idx, str(AOs), MOL, error]) + '\n'
+            else:
+                error = np.abs(np.array(pred) - np.array(vals))
+                error = ','.join([str(e) for e in error])
+                pred = ','.join([str(e) for e in pred])
+                vals = ','.join([str(e) for e in vals])
+                prediction += '\t'.join([idx, str(AOs), MOL, pred, vals, error]) + '\n'
 
         return MAE, prediction, loss_val / len(dataloader), losses_val
 
@@ -542,11 +618,17 @@ if __name__ == "__main__":
     seq_len = args.seq_len
 
     batch_size = args.batch_size
+    task = args.task
     operation = args.operation
     lr = args.lr
     iteration = args.iteration
     dropout = args.dropout
     num_workers = args.num_workers
+    data_dir = args.dataset_dir
+
+    transfer_flag = args.transfer_flag
+    dipole_mul = args.dipole_mul
+    force_posc = args.force_posc
 
     """Fix the random seed."""
     torch.manual_seed(1729)
@@ -561,7 +643,7 @@ if __name__ == "__main__":
     print('-' * 50)
 
     """Create the dataloaders of training, val, and test set."""
-    dir_dataset = '../dataset/' + dataset + '/' + 'create_data' + '_' + basis_set + '/'
+    dir_dataset = '../dataset/' + data_dir + dataset + '/' + 'create_data' + '_' + basis_set + '/'
     field = '_'.join([basis_set + '/'])
 
     dataset_train = MyDataset(dir_dataset + 'train_' + field)
@@ -581,7 +663,7 @@ if __name__ == "__main__":
     with open(dir_dataset + 'orbitaldict_' + basis_set + '.pickle', 'rb') as f:
         orbital_dict = pickle.load(f)
 
-    print('Set a D3-ResNet model.')
+    print('Set a D3-ImgNet model.')
     print('# of n_iterations:', iteration)
 
     N_orbitals = len(orbital_dict)
@@ -591,35 +673,49 @@ if __name__ == "__main__":
     """The output dimension in regression."""
     N_output = len(dataset_test[0][-2][0])
 
-    model = D3_ImgNet(device, basis_set, N_orbitals, dim,
-                      seq_len, operation, dropout=dropout).to(device)
+    model = D3_ImgNet(device, basis_set, N_orbitals, dim, seq_len, task, transfer_flag,
+                      force_posc=force_posc, dropout=dropout).to(device)
 
-    trainer = Trainer(model, lr)
-    tester = Tester(model)
+    if transfer_flag:
+        file_model = '../model/{}/best_model.pth'.format(task)
+        model.load_state_dict(torch.load(file_model, map_location=device))
+
+        for param in model.parameters():  # 对网络的所有参数进行for循环
+            param.requires_grad = False
+
+        if task == 'Force':
+            model.res_output = nn.Linear(256, 3).to(device)
+        else:
+            model.res_output = nn.Linear(256, 1).to(device)
+
+    trainer = Trainer(model, lr, task=task, operation=operation, dipole_mul=dipole_mul)
+    tester = Tester(model, task=task, operation=operation, dipole_mul=dipole_mul)
     print('# of model parameters:',
           sum([np.prod(p.size()) for p in model.parameters()]))
     print('-' * 50)
 
     """Output files."""
-    file_result = '../output/result--' + dataset + '.txt'
-    result = ('Epoch\tTime(sec)\tloss_E_sum\tlosses_val\tLoss_E\t'
-              'Loss_val\tMAE_val' + unit + '\tMAE_test' + unit)
+    file_result = '../output/{}/result--'.format(args.task) + dataset + '.txt'
+    result = ('Epoch\tTime(sec)\tloss_E_sum\tlosses_val\tLoss_E'
+              '\tLoss_val\tMAE_val' + unit + '\tMAE_test' + unit)
 
     with open(file_result, 'w') as f:
         f.write(result + '\n')
 
-    file_prediction = '../output/prediction--' + dataset + '.txt'
-    file_model = '../output/model--' + dataset + '.pth'
+    file_prediction = '../output/{}/prediction--'.format(args.task) + dataset + '.txt'
+    file_model = '../output/{}/model--'.format(args.task) + dataset + '.pth'
 
     print('Start training of the D3_ImgNet model...')
 
     start = timeit.default_timer()
     loss_val, MAE_min = np.inf, np.inf
 
+    MAE_test_list = []
     for epoch in range(iteration):
         loss_E, loss_E_sum = trainer.train(dataloader_train, epoch)
         MAE_val, _, loss_val, losses_val = tester.test(dataloader_val)
         MAE_test, prediction, _, losses_test = tester.test(dataloader_test)
+        MAE_test_list.append(np.mean(list(map(float, MAE_test.split(',')))))
 
         tqdm.write('\33[34m【losses_val】: {0}, 【MAE_val】: {1}\33[0m'.format(losses_val, MAE_val))
         tqdm.write('\33[34m【losses_test】: {0}, 【MAE_test】: {1}\33[0m'.format(losses_test, MAE_test))
@@ -632,8 +728,8 @@ if __name__ == "__main__":
 
         # Save the model with the best performance at last 10 epochs
         if epoch >= (iteration - 10):
-            if float(MAE_test) < MAE_min:
-                MAE_min = float(MAE_test)
+            if float(np.min(MAE_test_list[-1])) < MAE_min:
+                MAE_min = float(np.min(MAE_test_list[-1]))
                 tester.save_prediction(prediction, file_prediction)
                 tester.save_model(model, file_model)
 

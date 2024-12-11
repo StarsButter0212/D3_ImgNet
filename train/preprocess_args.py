@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 import numpy as np
 
-# Dataset.
-# dataset = 'QM9under7atoms_atomizationenergy_eV'
-dataset = 'QM9under14atoms_atomizationenergy_eV'
-# dataset = 'QM9over15atoms_atomizationenergy_eV'
+# Dataset Dir and params settings.
+dataset_dir = 'QM9_datasets/'
+# task = 'Force'
+task = 'Dipole & Energy'
+
+# dataset_dir = 'SN2_datasets/'
+# task = 'SN2_all'
+
+if task == 'Force':
+	dataset = 'QM9under14atoms_force_and_AE_eV'
+elif task == 'Dipole & Energy':
+	dataset = 'QM9under14atoms_dipole_and_AE_eV'
+elif task == 'SN2_all':
+	dataset = 'SN2_all_potential_energy_eV'
+else:
+	print('Task not recognized')
 
 # Basis set.
 basis_set = '6-311G'                # '6-311G.gbs'
@@ -17,7 +29,3 @@ n_points = 14                       # one circle's points
 n_theta = 4
 rot_angle = np.pi/n_theta
 rot_axis = [0, 0, 1]               # z-axis
-
-
-
-

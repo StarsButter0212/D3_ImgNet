@@ -29,8 +29,10 @@ all_atoms = ['H', 'He', 'Li', 'Be', 'B', 'C', 'N', 'O', 'F', 'Ne',
              'Rg', 'Cn', 'Nh', 'Fl', 'Mc', 'Lv', 'Ts', 'Og']
 
 atomicnumber_dict = dict(zip(all_atoms, range(1, len(all_atoms)+1)))
+number2atoms_dict = dict(zip(range(1, len(all_atoms)+1), all_atoms))
 
-basis_dict = {'STO-3G': [1, 1], '6-31G': [6, 4], '6-311G': [6, 5]}
+atomic_mass = {'H': 1, 'C': 12, 'N': 14, 'O': 16, 'F': 19}
+basis_dict  = {'STO-3G': [1, 1], '6-31G': [6, 4], '6-311G': [6, 5]}
 
 
 def create_gauss_grid_field(R, n_point, theta, u):
@@ -82,8 +84,19 @@ def create_distancematrix(coords1, coords2):
     return np.where(distance_matrix == 0.0, 1e6, distance_matrix)
 
 
+def create_atomic_distance_from_molecular_mass(atoms, atomic_coords):
+    """Create the atomic distance from_molecular mass."""
+    atoms_mass = [atomic_mass[atom] for atom in atoms]
+    atoms_mass_sum = np.sum(atoms_mass)
+    atoms_mass = np.asarray(atoms_mass)[:, None]
+    atomic_coords = np.asarray(atomic_coords)
+    r_cm = np.sum(atoms_mass * atomic_coords, axis=0) / atoms_mass_sum
+    return atomic_coords - r_cm
+
+
 def create_dataset(dir_dataset, filename, basis_set, radius_min, radius_max,
-                   radius_step, n_points, rot_angle, rot_axis, orbital_dict, property=True):
+                   radius_step, n_points, rot_angle, rot_axis, orbital_dict,
+                   property=True, task='Force'):
 
     """Directory of a preprocessed dataset."""
     dir_preprocess = (dir_dataset + 'create_data' + '_' + basis_set +
@@ -128,10 +141,27 @@ def create_dataset(dir_dataset, filename, basis_set, radius_min, radius_max,
         orbital_coords = []
         n_quantum_numbers = []
         integral_exponents = []
+        atomic_forces = []
+        partial_charges = []
 
         """Load the 3D molecular structure data."""
+        if task == 'Force':
+            force_data = atom_xyzs[len(atom_xyzs) // 2:]
+            atom_xyzs = atom_xyzs[:len(atom_xyzs) // 2]
+
+            for force in force_data:
+                f1, f2, f3 = force.split()
+                fff = [float(v) for v in [f1, f2, f3]]
+                atomic_forces.append(fff)
+
         for atom_xyz in atom_xyzs:
-            atom, x, y, z = atom_xyz.split()
+            if task == 'Dipole & Energy':
+                atom, x, y, z, e = atom_xyz.split()
+                partial_charges.append([float(e)])
+
+            else:
+                atom, x, y, z = atom_xyz.split()
+
             atoms.append(atom)
             atomic_number = atomicnumber_dict[atom]
             atomic_numbers.append([atomic_number])
@@ -164,6 +194,13 @@ def create_dataset(dir_dataset, filename, basis_set, radius_min, radius_max,
         n_quantum_numbers = np.array([n_quantum_numbers])
         l_quantum_numbers = np.array([np.sum(np.asarray(integral_exponents), axis=1)])
         N_electrons = np.array([[N_electrons]])
+        atomic_numbers = np.asarray(atomic_numbers)
+        partial_charges = np.asarray(partial_charges)
+
+        if task == 'Dipole & Energy':
+            atomic_pcoords = create_atomic_distance_from_molecular_mass(atoms, atomic_coords)
+        else:
+            atomic_pcoords = atomic_coords
 
         """Save the above set of data."""
         data = [idx,
@@ -174,7 +211,17 @@ def create_dataset(dir_dataset, filename, basis_set, radius_min, radius_max,
                 l_quantum_numbers.astype(np.float32),
                 N_electrons.astype(np.float32),
                 property_values.astype(np.float32),
-                molecular_formula]
+                molecular_formula,
+                atomic_numbers.astype(np.float32),
+                atomic_pcoords.astype(np.float32),
+                field_coords.astype(np.float32)]
+
+        if task == 'Dipole & Energy':
+            data += [partial_charges.astype(np.float32)]
+
+        if task == 'Force':
+            atomic_forces = np.asarray(atomic_forces)
+            data += [atomic_forces.astype(np.float32)]
 
         data = np.array(data, dtype=object)
         np.save(dir_preprocess + idx, data)
@@ -187,6 +234,7 @@ def create_dataset(dir_dataset, filename, basis_set, radius_min, radius_max,
 if __name__ == "__main__":
 
     """Args."""
+    data_dir = args.dataset_dir
     dataset = args.dataset
     basis_set = args.basis_set
     radius_min = args.radius_min
@@ -195,9 +243,10 @@ if __name__ == "__main__":
     n_points = args.n_points
     rot_angle = args.rot_angle
     rot_axis = args.rot_axis
+    task = args.task
 
     """Dataset directory."""
-    dir_dataset = '../dataset/' + dataset + '/'
+    dir_dataset = '../dataset/' + data_dir + dataset + '/'
 
     """Initialize orbital_dict, in which
     each key is an orbital type and each value is its index.
@@ -205,28 +254,26 @@ if __name__ == "__main__":
     orbital_dict = defaultdict(lambda: len(orbital_dict))
     print('Preprocess', dataset, 'dataset.\n'
           'The preprocessed dataset is saved in', dir_dataset, 'directory.\n'
-          'If the dataset size is large, '
-          'it takes a long time and consume storage.\n'
           'Wait for a while...')
     print('-'*50)
 
     print('Training dataset...')
     create_dataset(dir_dataset, 'train',
                    basis_set, radius_min, radius_max, radius_step,
-                   n_points, rot_angle, rot_axis, orbital_dict)
-    print('-'*50)
+                   n_points, rot_angle, rot_axis, orbital_dict, task=task)
+    print('-' * 50)
 
     print('Validation dataset...')
     create_dataset(dir_dataset, 'val',
                    basis_set, radius_min, radius_max, radius_step,
-                   n_points, rot_angle, rot_axis, orbital_dict)
-    print('-'*50)
+                   n_points, rot_angle, rot_axis, orbital_dict, task=task)
+    print('-' * 50)
 
     print('Test dataset...')
     create_dataset(dir_dataset, 'test',
                    basis_set, radius_min, radius_max, radius_step,
-                   n_points, rot_angle, rot_axis, orbital_dict)
-    print('-'*50)
+                   n_points, rot_angle, rot_axis, orbital_dict, task=task)
+    print('-' * 50)
 
     dir_preprocess = (dir_dataset + 'create_data' + '_' + basis_set + '/')
     with open(dir_preprocess + 'orbitaldict_' + basis_set + '.pickle', 'wb') as f:
